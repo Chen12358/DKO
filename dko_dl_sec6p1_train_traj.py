@@ -422,7 +422,7 @@ def main():
     ap.add_argument("--pin_memory", action="store_true")
 
     # Logging/saving
-    ap.add_argument("--log_every", type=int, default=50, help="log every N optimization steps")
+    ap.add_argument("--log_every", type=int, default=50, help="log every N epochs (epoch-based logging)")
     ap.add_argument("--save_every", type=int, default=500, help="save every N optimization steps")
     ap.add_argument("--kmax", type=int, default=12, help="analytic spectrum compare up to kmax")
     ap.add_argument("--A_global_batches", type=int, default=4, help="batches to estimate A_global on val split")
@@ -580,76 +580,93 @@ def main():
             sums["pred"] += float(mets["pred"])
             n_batches += 1
 
-            # Periodic logging + A_global spectrum
-            if (global_step % args.log_every) == 0:
-                train_m = {k: v / max(1, n_batches) for k, v in sums.items()}
-
-                val_m = eval_epoch(model, val_loader, device, eval_horizon, args.eval_start_time,
-                                   args.lambda_lin, args.lambda_pred, args.gamma, args.ridge)
-                score = select_score(val_m, args.select_metric)
-
-                cpu_u, gpu_u, gpu_mem_u = get_utilization(device)
-                util_str = []
-                if cpu_u is not None:
-                    util_str.append(f"CPU={cpu_u:.0f}%")
-                if gpu_u is not None:
-                    util_str.append(f"GPU={gpu_u:.0f}%")
-                if gpu_mem_u is not None:
-                    util_str.append(f"GPUmem={gpu_mem_u:.0f}%")
-                util_str = (" | " + " ".join(util_str)) if util_str else ""
-
-                print(
-                    f"[step {global_step:07d} | ep {epoch:04d}] H={H:02d} | "
-                    f"train loss={train_m['loss']:.6f} lin={train_m['lin']:.6f} pred={train_m['pred']:.6f} | "
-                    f"val loss={val_m['loss']:.6f} lin={val_m['lin']:.6f} pred={val_m['pred']:.6f} | "
-                    f"select={score:.6f}{util_str}"
-                )
-
-                with open(log_path, "a") as f:
-                    f.write(
-                        f"{global_step},{epoch},{H},{train_m['loss']},{train_m['lin']},{train_m['pred']},"
-                        f"{val_m['loss']},{val_m['lin']},{val_m['pred']},{score},"
-                        f"{'' if cpu_u is None else cpu_u},{'' if gpu_u is None else gpu_u},{'' if gpu_mem_u is None else gpu_mem_u}\n"
-                    )
-
-                # Compute A_global on val split and save spectrum plot
-                try:
-                    A_global = estimate_A_global(
-                        model, val_loader, device,
-                        start_time=int(args.eval_start_time),
-                        ridge=args.ridge,
-                        max_batches=int(args.A_global_batches),
-                    )
-                    spec_dir = os.path.join(args.out_dir, "spectrum_trace")
-                    out_png = os.path.join(spec_dir, f"spectrum_step{global_step:07d}_ep{epoch:04d}.png")
-                    save_spectrum_plot(A_global, out_png, n=args.latent_dim, kmax=args.kmax)
-                except Exception as e:
-                    print(f"[warn] step={global_step} | failed to compute/plot A_global spectrum: {e}")
-
-                # Best checkpoint
-                if score < best_score:
-                    best_score = score
-                    ckpt = dict(
-                        step=global_step,
-                        epoch=epoch,
-                        model_state=model.state_dict(),
-                        cfg=asdict(cfg),
-                        val_metrics=val_m,
-                        best_score=best_score,
-                        select_metric=args.select_metric,
-                    )
-                    # Save latest A_global as well (best-effort)
-                    try:
-                        ckpt["A_global"] = A_global
-                    except Exception:
-                        pass
-                    torch.save(ckpt, best_path)
-
             # Periodic raw checkpoint
             if (global_step % args.save_every) == 0:
                 ckpt_path = os.path.join(args.out_dir, f"ckpt_step{global_step:07d}.pt")
                 torch.save(dict(step=global_step, epoch=epoch, model_state=model.state_dict(), cfg=asdict(cfg)), ckpt_path)
 
+
+        # ---- end of epoch: evaluate / select best (epoch-based logging) ----
+        train_m = {k: v / max(1, n_batches) for k, v in sums.items()}
+
+        # Always compute validation to track best checkpoint reliably
+        val_m = eval_epoch(
+            model, val_loader, device,
+            horizon=eval_horizon,
+            start_time=args.eval_start_time,
+            lambda_lin=args.lambda_lin,
+            lambda_pred=args.lambda_pred,
+            gamma=args.gamma,
+            ridge=args.ridge,
+        )
+        score = select_score(val_m, args.select_metric)
+
+        # Best checkpoint (evaluate every epoch; save best)
+        if score < best_score:
+            best_score = score
+            ckpt = dict(
+                step=global_step,
+                epoch=epoch,
+                model_state=model.state_dict(),
+                cfg=asdict(cfg),
+                val_metrics=val_m,
+                best_score=best_score,
+                select_metric=args.select_metric,
+            )
+            # Save A_global best-effort (computed only on log epochs below)
+            torch.save(ckpt, best_path)
+
+        # Utilization snapshot
+        cpu_u, gpu_u, gpu_mem_u = get_utilization(device)
+
+        # CSV logging (epoch-based; one line per epoch)
+        with open(log_path, "a") as f:
+            f.write(
+                f"{global_step},{epoch},{H},{train_m['loss']},{train_m['lin']},{train_m['pred']},"
+                f"{val_m['loss']},{val_m['lin']},{val_m['pred']},{score},"
+                f"{'' if cpu_u is None else cpu_u},{'' if gpu_u is None else gpu_u},{'' if gpu_mem_u is None else gpu_mem_u}\n"
+            )
+
+        # Only print + spectrum plot every N epochs
+        if (epoch % args.log_every) == 0:
+            util_str = []
+            if cpu_u is not None:
+                util_str.append(f"CPU={cpu_u:.0f}%")
+            if gpu_u is not None:
+                util_str.append(f"GPU={gpu_u:.0f}%")
+            if gpu_mem_u is not None:
+                util_str.append(f"GPUmem={gpu_mem_u:.0f}%")
+            util_str = (" | " + " ".join(util_str)) if util_str else ""
+
+            print(
+                f"[ep {epoch:04d}] H={H:02d} | "
+                f"train loss={train_m['loss']:.6f} lin={train_m['lin']:.6f} pred={train_m['pred']:.6f} | "
+                f"val loss={val_m['loss']:.6f} lin={val_m['lin']:.6f} pred={val_m['pred']:.6f} | "
+                f"select={score:.6f}{util_str}"
+            )
+
+            # Compute A_global on val split and save spectrum plot (epoch-indexed filename)
+            try:
+                A_global = estimate_A_global(
+                    model, val_loader, device,
+                    start_time=int(args.eval_start_time),
+                    ridge=args.ridge,
+                    max_batches=int(args.A_global_batches),
+                )
+                spec_dir = os.path.join(args.out_dir, "spectrum_trace")
+                out_png = os.path.join(spec_dir, f"spectrum_ep{epoch:04d}.png")
+                save_spectrum_plot(A_global, out_png, n=args.latent_dim, kmax=args.kmax)
+
+                # Also update best checkpoint with A_global if this epoch is best
+                if score <= best_score + 1e-12:
+                    try:
+                        ckpt = torch.load(best_path, map_location=device)
+                        ckpt["A_global"] = A_global
+                        torch.save(ckpt, best_path)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[warn] ep={epoch:04d} | failed to compute/plot A_global spectrum: {e}")
         # end epoch loop over loader
 
     print(f"[done] best score={best_score:.6f} | ckpt: {best_path}")
